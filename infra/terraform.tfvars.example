@@ -4,5 +4,5 @@ prefijo  = "grupo6"
 
 # Las imágenes se construyen después de crear el registro. La ruta es la que
 # muestra "terraform output registro" seguida del nombre de la imagen y su etiqueta.
-imagen_backend  = "us-central1-docker.pkg.dev/cloud-computing-470223/grupo6-imagenes/backend:v1"
-imagen_frontend = "us-central1-docker.pkg.dev/cloud-computing-470223/grupo6-imagenes/frontend:v1"
+imagen_backend  = "us-central1-docker.pkg.dev/cloud-computing-470223/grupo6-imagenes/backend:v2"
+imagen_frontend = "us-central1-docker.pkg.dev/cloud-computing-470223/grupo6-imagenes/frontend:v2"
