@@ -6,3 +6,4 @@ prefijo  = "grupo6"
 # muestra "terraform output registro" seguida del nombre de la imagen y su etiqueta.
 imagen_backend  = "us-central1-docker.pkg.dev/cloud-computing-470223/grupo6-imagenes/backend:v2"
 imagen_frontend = "us-central1-docker.pkg.dev/cloud-computing-470223/grupo6-imagenes/frontend:v2"
+imagen_cocina = "us-central1-docker.pkg.dev/cloud-computing-470223/grupo6-imagenes/cocina:v2"
