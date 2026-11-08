@@ -108,7 +108,10 @@ def recibir():
 
     time.sleep(TIEMPO_PREPARACION)
 
-    resultado, faltan = terminar_pedido(db().transaction(), pedido_ref, cantidades)
+    # Con una ráfaga, muchos pedidos pelean por el mismo documento de inventario
+    # y Firestore aborta a los que pierden. Se les da más intentos que los 5 por
+    # defecto; si aun así falla, la cocina responde 500 y Pub/Sub reentrega.
+    resultado, faltan = terminar_pedido(db().transaction(max_attempts=10), pedido_ref, cantidades)
     if resultado == "repetido":
         log.info("El pedido %s lo terminó otra entrega mientras se preparaba; no se descuenta de nuevo", pedido_id)
     elif resultado == "rechazado":

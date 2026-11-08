@@ -207,74 +207,117 @@ Frontend:
 
 ## Decisiones del reto
 
-El reto tenía dos problemas que Pub/Sub provoca por su forma de entregar mensajes: el plato misterioso se reintenta sin parar, y un mismo pedido puede llegar más de una vez y descontar el inventario de más. Resolvimos cada uno en el lugar donde tiene sentido hacerlo.
+El reto tenía dos problemas que Pub/Sub provoca por su forma de entregar mensajes: un mismo pedido puede llegar más de una vez (y descontar el inventario de más), y el plato misterioso se reintenta sin parar. Cada decisión de abajo responde una de las cuatro que pide la guía.
 
-### 1. El plato misterioso: tema de mensajes muertos
-
-**Qué cambiamos** (`infra/pubsub.tf`):
-
-- Un tema `<prefijo>-pedidos-muertos` y una suscripción pull `<prefijo>-pedidos-muertos` que guarda lo que llegue, durante 7 días.
-- Una `dead_letter_policy` en la suscripción de la cocina con `max_delivery_attempts = 5`.
-- Dos permisos para el agente de servicio de Pub/Sub: `pubsub.publisher` sobre el tema de mensajes muertos y `pubsub.subscriber` sobre la suscripción de la cocina.
-
-**Por qué:**
-
-- *Reintentar para siempre no sirve.* El plato misterioso falla siempre, porque la cocina no tiene receta. Un reintento más no lo arregla; solo llena los logs durante los 7 días que Pub/Sub retiene el mensaje. Después de 5 intentos lo correcto es apartarlo y dejar de gastar recursos.
-- *Elegimos 5 intentos porque es el mínimo que permite Pub/Sub.* Con el `retry_policy` que ya teníamos (de 10 s a 60 s entre intentos), el mensaje se descarta en unos 2 o 3 minutos. Los fallos pasajeros de verdad, como una cocina que se reinicia, se resuelven en el segundo o tercer intento, así que 5 deja margen sin alargar la espera.
-- *Una suscripción en el tema de mensajes muertos.* Un tema sin suscripciones descarta lo que recibe, y el pedido fallido se perdería sin que nadie pueda revisarlo. Con la suscripción pull queda guardado para inspeccionarlo o reprocesarlo a mano.
-- *Los dos permisos son el mínimo.* Quien mueve el mensaje al tema de mensajes muertos no es la cocina ni el backend, sino el agente de Pub/Sub. Necesita publicar en el tema nuevo y confirmar el mensaje original en la suscripción. Cada permiso está dado sobre ese recurso y no sobre todo el proyecto, igual que el resto de la práctica.
-
-**Cómo se comprueba:**
-
-```bash
-# Crear un pedido con "plato-misterioso" desde la página y luego:
-gcloud run services logs read <prefijo>-cocina --region us-central1 --limit 30
-#   → "intento de entrega 1", "2", ... "5" y después ya no aparecen más
-
-gcloud pubsub subscriptions pull <prefijo>-pedidos-muertos --limit 5 --auto-ack
-#   → devuelve el id del pedido que falló
-```
-
-<!-- TODO: pegar aquí la captura de los logs con los 5 intentos y la salida del pull. -->
-
-**Límite que conocemos:** el pedido del plato misterioso se queda en `preparando` en la pantalla, porque la cocina falla antes de cambiarlo. Una mejora sería que un proceso lea el tema de mensajes muertos y pase esos pedidos a `rechazado`. No lo hicimos porque el enunciado pide detener los reintentos, no cambiar el estado del pedido.
-
-### 2. Entregas repetidas: cocina idempotente
+### 1. Cómo sabe la cocina que un pedido ya se preparó
 
 **Qué cambiamos** (`cocina/main.py`):
 
-- Si el pedido ya está en `listo` o `rechazado` cuando llega el mensaje, la cocina responde `204` sin preparar nada.
-- Revisar el inventario, descontarlo y marcar el pedido como `listo` (o `rechazado`) ahora ocurre dentro de **una transacción de Firestore**, y dentro de ella se vuelve a leer el estado del pedido.
+- Al llegar un mensaje, la cocina lee el campo `estado` del pedido. Si ya es `listo` o `rechazado`, responde `204` sin preparar nada.
+- Revisar el inventario, descontarlo y pasar el pedido a `listo` (o `rechazado`) ocurre ahora en **una sola transacción de Firestore**, y dentro de ella se vuelve a leer `estado`.
 
 **Por qué:**
 
-- *Pub/Sub entrega "al menos una vez", no "exactamente una".* Se puede provocar con `PROBABILIDAD_FALLO`: la cocina termina el trabajo, se cae antes de responder `2xx` y Pub/Sub entrega el mismo pedido otra vez. Con el código original, el descuento se repetía en cada entrega. La entrega exactamente una vez de Pub/Sub existe solo para suscripciones pull, no para push, así que no era una opción y la solución tiene que estar en la cocina.
-- *El estado del pedido ya es la llave de idempotencia.* Podíamos haber guardado los `messageId` ya vistos en una colección nueva, pero el pedido ya dice si terminó. Así no hay una segunda fuente de verdad que mantener ni una colección que crezca sin límite.
-- *La revisión de antes de empezar no basta, por eso la transacción.* Dos entregas pueden llegar casi a la vez (Cloud Run tiene hasta 3 instancias): las dos ven `preparando`, las dos esperan los 6 s y las dos descuentan. Dentro de la transacción Firestore reintenta a la que pierde, y esa segunda ya ve el pedido terminado y no descuenta.
-- *Revisar y descontar juntos.* Antes la cocina leía las existencias y luego escribía en pasos separados. En la transacción las lecturas y las escrituras son atómicas, lo que también evita vender dos veces la última empanada.
-- *Lo que no cambiamos.* El plato misterioso sigue respondiendo `500` y los sobres inválidos `400`. Eso es lo que hace funcionar los reintentos y la política de mensajes muertos del punto 1.
+- *El dato que consulta es el estado del pedido.* El pedido ya dice si terminó, así que no hace falta una segunda fuente de verdad. La alternativa era guardar los `messageId` vistos en una colección nueva; la descartamos porque habría que mantenerla y limpiarla, y porque el estado hace el mismo trabajo. Tampoco podíamos pedirle a Pub/Sub entrega exactamente una vez: esa opción existe solo para suscripciones pull, y la nuestra es push.
+- *La revisión de antes de empezar no basta para entregas simultáneas.* Si dos instancias reciben el mismo pedido a la vez, las dos lo ven en `preparando`, las dos esperan los 6 s y las dos llegan al descuento. Por eso la comprobación definitiva está dentro de la transacción: Firestore deja pasar a una, aborta a la otra y la reintenta, y esa segunda vuelta ya lee `listo` y no descuenta. La revisión de afuera solo ahorra los 6 s de trabajo en el caso común de una reentrega tardía.
+- *Revisar y descontar en el mismo paso arregla también la fase 4.* Antes la cocina leía las existencias y descontaba después, así que con muchos pedidos a la vez todos veían que alcanzaba y el tinto quedaba en negativo. En la transacción, si dos pedidos pelean por la última unidad, uno la lleva y el otro ve `0` y se rechaza.
+- *Más intentos para la transacción.* Con una ráfaga todos los pedidos pelean por el mismo documento de inventario y Firestore aborta a los perdedores. Subimos `max_attempts` de 5 (por defecto) a 10. Si aun así una transacción falla, la cocina responde `500` y Pub/Sub reentrega; como la cocina es idempotente, repetir es seguro.
+- *Qué no cambiamos.* El plato misterioso sigue respondiendo `500` y los sobres inválidos `400`, porque eso es lo que activa los reintentos y la política de mensajes muertos.
 
-**Cómo se comprueba:** con una cocina local que siempre falla después de terminar (`PROBABILIDAD_FALLO=1`), entregando el mismo pedido dos veces:
+### 2. Cuántos intentos antes de rendirse
+
+**Qué cambiamos** (`infra/pubsub.tf`): una `dead_letter_policy` en la suscripción de la cocina con `max_delivery_attempts = 5`.
+
+**Por qué:**
+
+- *5 es el mínimo que admite Pub/Sub.* El plato misterioso falla siempre porque la cocina no tiene receta; un intento más nunca lo arregla y solo llena los logs durante los 7 días que Pub/Sub retiene el mensaje. Por eso pusimos el valor más bajo posible en vez de uno grande.
+- *Con el `retry_policy` que ya teníamos (de 10 s a 60 s entre intentos), 5 intentos son unos 2 o 3 minutos.* Es tiempo de sobra para un problema pasajero: una instancia que arranca en frío, una transacción que perdió la pelea por el inventario o un reinicio de la cocina se resuelven en el segundo o tercer intento.
+- *Qué pasa con un pedido que falla por un problema pasajero.* Como la cocina solo descarta pedidos en `listo` o `rechazado`, un pedido que se quedó en `preparando` por una falla pasajera **sí se vuelve a preparar** en el siguiente intento. Solo llega al tema de muertos si falla 5 veces seguidas.
+- *Con `PROBABILIDAD_FALLO` en 0.5, 5 intentos casi nunca se agotan.* Un pedido que ya quedó `listo` responde `204` apenas se reentrega, así que cada pedido recibe como mucho dos entregas y ninguno llega a mensajes muertos (ver pregunta 3).
+
+**Límite que conocemos:** el pedido del plato misterioso se queda en `preparando` en la pantalla, porque la cocina falla antes de cambiarlo, y no hay quien lo pase a `rechazado`. Una mejora sería un proceso que lea el tema de muertos y marque esos pedidos. No la hicimos porque el reto pide detener los reintentos y poder leer el mensaje, no cambiar el estado.
+
+### 3. Los permisos de los mensajes muertos
+
+**Qué cambiamos** (`infra/pubsub.tf`): un tema `<prefijo>-pedidos-muertos`, una suscripción pull `<prefijo>-pedidos-muertos` sobre ese tema (con retención de 7 días), y dos permisos para el agente de servicio de Pub/Sub:
+
+| Permiso | Sobre qué recurso | Para qué |
+|---|---|---|
+| `roles/pubsub.publisher` | el tema `<prefijo>-pedidos-muertos` | Quien copia el mensaje fallido al tema de muertos es el agente de Pub/Sub, no la cocina ni el backend. Sin este permiso no puede publicar y el mensaje se sigue reintentando. |
+| `roles/pubsub.subscriber` | la suscripción `<prefijo>-cocina` | Después de reenviar el mensaje, el agente tiene que confirmarlo (ack) en la suscripción original para que deje de reintentarse. Confirmar es una acción de suscriptor. |
+
+**Qué pasaría sin la suscripción en el tema de muertos:** un tema de Pub/Sub no guarda mensajes por sí mismo, solo los entrega a sus suscripciones. Sin suscripción, el mensaje llegaría al tema y se descartaría: la cocina dejaría de reintentar, pero el id del pedido fallido se perdería y nadie podría leerlo ni reprocesarlo. Por eso la suscripción pull es obligatoria, y la dejamos con 7 días de retención (el máximo) para dar tiempo de revisar.
+
+Los dos permisos están dados sobre el recurso concreto y no sobre todo el proyecto, igual que el resto de la práctica.
+
+### 4. Cómo medimos
+
+La guía pide medir cuánto tarda el último pedido de una ráfaga en quedar terminado y cómo cambia con el máximo de instancias de la cocina, y contar las lecturas y escrituras de Firestore por pedido.
+
+**Qué cambiamos:** el máximo de instancias de la cocina ahora es la variable `max_instancias_cocina` (por defecto 3, como antes), para cambiarlo desde `terraform.tfvars` sin tocar el recurso.
+
+**Comando.** Se lanzan 60 pedidos en paralelo, se guardan sus ids y se consulta cada pedido hasta que todos estén en `listo` o `rechazado` (un rechazo también espera los 6 s de preparación, así que cuenta igual para el tiempo):
 
 ```bash
-curl -s localhost:8081/menu                  # anota las existencias de lo que pediste
-curl -i -X POST localhost:8082/ -H 'Content-Type: application/json' \
-  -d "{\"message\": {\"data\": \"$(printf %s "$ID" | base64)\"}, \"deliveryAttempt\": 1}"   # 500, trabajo hecho
-curl -i -X POST localhost:8082/ -H 'Content-Type: application/json' \
-  -d "{\"message\": {\"data\": \"$(printf %s "$ID" | base64)\"}, \"deliveryAttempt\": 2}"   # 204, no hace nada
-curl -s localhost:8081/menu                  # bajaron una sola vez
+B=$(terraform output -raw url_backend)
+# reponer el inventario desde la pantalla antes de cada medición
+INICIO=$(date +%s)
+seq 60 | xargs -P 20 -I{} curl -s -X POST $B/pedidos -H 'Content-Type: application/json' \
+  -d '{"cliente": "Medida {}", "items": [{"producto": "jugo-natural", "cantidad": 1}]}' \
+  | jq -r .id > ids.txt
+while true; do
+  PENDIENTES=$(while read id; do curl -s $B/pedidos/$id | jq -r .estado; done < ids.txt | grep -cv -e listo -e rechazado)
+  [ "$PENDIENTES" -eq 0 ] && break
+  sleep 2
+done
+echo "El último pedido terminó $(( $(date +%s) - INICIO )) s después de lanzar la ráfaga"
 ```
 
-(La cocina local se levanta como en la sección de `docker run`, agregando `-e PROBABILIDAD_FALLO=1`.) Con el código original, las existencias bajaban en cada entrega; ahora bajan una sola vez. También probamos la lógica de la cocina con un Firestore simulado: entrega normal, tres reentregas seguidas, reentrega mientras otra termina, rechazo por falta de inventario, plato misterioso (`500`) y sobre inválido (`400`).
+Se repite cada configuración 3 veces (tomando la mediana) y se cambia `max_instancias_cocina` entre 1, 2 y 3 con `terraform apply`.
 
-<!-- TODO: pegar aquí las existencias antes y después, y los logs de la cocina con "entrega repetida". -->
+**Qué debería limitar el tiempo (hipótesis, no medido):** cada instancia atiende 8 pedidos a la vez (`max_instance_request_concurrency`) y cada pedido tarda 6 s, así que con `N` instancias salen `8 × N` pedidos cada 6 s. Para 60 pedidos serían unos 48 s con 1 instancia, 24 s con 2 y 18 s con 3, más el arranque en frío de las instancias y la espera de la cola. Si lo medido se aleja de esto, la diferencia se explica con eso.
+
+| Instancias máximas | Medición 1 (s) | Medición 2 (s) | Medición 3 (s) | Mediana (s) | Esperado (s) |
+|---|---|---|---|---|---|
+| 1 | | | | | ≈ 48 |
+| 2 | | | | | ≈ 24 |
+| 3 | | | | | ≈ 18 |
+
+<!-- TODO: llenar con las mediciones reales y decir qué limitó el tiempo (concurrencia de la cocina, arranque en frío, contención de Firestore...). -->
+
+**Lecturas y escrituras de Firestore por pedido** (contadas del código, para un pedido con `n` productos distintos y sin fallas):
+
+| Quién | Lecturas | Escrituras |
+|---|---|---|
+| Backend (`POST /pedidos`) | 0 | 2 (contador y pedido) |
+| Cocina de la plantilla | `1 + n` | `n + 2` (`preparando`, un descuento por producto y `listo`) |
+| Cocina idempotente | `n + 2` (una más: se relee el estado dentro de la transacción) | `n + 2` |
+
+Para un pedido de un tinto, la cocina idempotente cuesta 3 lecturas y 3 escrituras, más las 2 escrituras del backend: **3 lecturas y 5 escrituras**. A eso se suman las lecturas de la página, que consulta el pedido cada pocos segundos (1 lectura por consulta) y la lista de los últimos 20 (hasta 20 por consulta). Una reentrega agrega 1 lectura. Si Firestore aborta una transacción por contención, esta se reintenta y repite sus lecturas.
+
+<!-- TODO: contrastar esta cuenta con el uso real en la consola de Firestore (pestaña Usage). -->
+
+### Cómo comprobamos que funciona
+
+- **Idempotencia.** Con la falla al 0.5 el inventario tiene que cuadrar: cada pedido baja las existencias una sola vez. Probamos la lógica de la cocina con un Firestore simulado: 4000 pedidos con `PROBABILIDAD_FALLO = 0.5` descontaron exactamente 4000 tintos, ninguno llegó a mensajes muertos y cada pedido recibió en promedio 1.508 entregas. También probamos tres reentregas seguidas, una reentrega mientras otra termina, un rechazo por falta de inventario, el plato misterioso (`500`) y un sobre inválido (`400`). Falta repetirlo en la nube.
+- **Mensajes muertos.** Se crea un pedido con `plato-misterioso`; en los logs de la cocina el intento deja de decir "desconocido" y pasa de 1 a 5, y después no aparecen más. El mensaje se lee de la suscripción de muertos:
+
+```bash
+gcloud run services logs read <prefijo>-cocina --region us-central1 --limit 30
+gcloud pubsub subscriptions pull <prefijo>-pedidos-muertos --limit 5 --auto-ack
+```
+
+<!-- TODO: pegar la captura de los logs con los 5 intentos y la salida del pull. -->
+
+- **Reproducir.** `terraform destroy`, esperar unos 5 minutos (Firestore no deja reutilizar enseguida el nombre de una base borrada) y volver a aplicar con los mismos pasos del primer despliegue. No hay pasos a mano en la consola.
+
+<!-- TODO: dejar constancia de la reproducción completa desde cero. -->
 
 ### Cómo desplegar estos cambios
 
 La imagen de la cocina cambió, así que hay que subirla con una etiqueta nueva (si no, Terraform no ve el cambio):
 
 ```bash
-cd <tu-repositorio>
 docker build -t $REGISTRO/cocina:v2 cocina
 docker push $REGISTRO/cocina:v2
 # En infra/terraform.tfvars: imagen_cocina = "<...>/cocina:v2"
@@ -283,4 +326,26 @@ cd infra && terraform apply
 
 ## Preguntas
 
-<!-- Las respuestas a las preguntas de la guía. -->
+<!-- Pregunta 1: ¿Por qué el pedido de la fase 2 nunca se preparó, aunque después crearon la suscripción? -->
+
+<!-- Pregunta 2: Si quitan el run.invoker de la cuenta invocadora, ¿qué deja de funcionar, cuánto tarda en notarse, qué ve el cliente y dónde encontrarían el error? -->
+
+### 3. Con `PROBABILIDAD_FALLO` en 0.5, ¿cuántas veces le llega en promedio un mismo pedido a la cocina?
+
+Con la cocina de la plantilla, en promedio **2 veces**, y con nuestra cocina idempotente, **1.5 veces**. Con la falla al 0.5, cada vez que la cocina procesa una entrega termina el trabajo y después responde `500` con probabilidad de un medio; entonces Pub/Sub no recibe el `2xx` y entrega el mismo mensaje otra vez. En la cocina de la plantilla, cada entrega repite todo: vuelve a hacer el trabajo y vuelve a tirar la moneda, así que el número de entregas hasta que una salga bien es una variable geométrica, cuyo promedio es 1 / (1 − 0.5) = 2. Como la suscripción ahora se rinde a los 5 intentos, el promedio real es un poco menor, 1 + 1/2 + 1/4 + 1/8 + 1/16 = 1.94, y uno de cada 32 pedidos (1/2⁵) agotaría los 5 intentos y terminaría en el tema de muertos aunque ya estuviera `listo`. En la cocina idempotente la primera entrega es igual (falla con probabilidad 0.5), pero la segunda ya encuentra el pedido en `listo` y responde `204` antes de llegar al sorteo de la falla, así que ningún pedido recibe más de 2 entregas: 1 + 0.5 = 1.5. Los dos números son distintos porque en la plantilla la reentrega es otra oportunidad de fallar y además descuenta de nuevo (cada pedido gasta en promedio 2 unidades de inventario en vez de 1), mientras que en la idempotente la reentrega es inofensiva y corta la cadena.
+
+Comparado con lo que medimos: en una simulación de la lógica de la cocina con un Firestore simulado (4000 pedidos, falla al 0.5, máximo 5 entregas) cada pedido recibió en promedio 1.508 entregas, muy cerca del 1.5 esperado, y el inventario descontó exactamente 4000 unidades. En la nube se mide contando las líneas "intento de entrega" por pedido en los registros de la cocina (con un mínimo de unos 50 pedidos, porque con 4 el promedio varía demasiado):
+
+```bash
+gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="<prefijo>-cocina" AND textPayload:"intento de entrega"' \
+  --limit 1000 --format='value(textPayload)' \
+  | awk '{c[$2]++} END {for (i in c) {n++; t += c[i]} print t / n, "entregas por pedido,", n, "pedidos"}'
+```
+
+| Cocina | Esperado | Medido en la nube |
+|---|---|---|
+| Plantilla | 2 (1.94 con tope de 5 intentos) | |
+| Idempotente | 1.5 | |
+
+<!-- TODO: llenar la columna "Medido en la nube" con la salida del comando para cada cocina y comentar la diferencia. -->
+

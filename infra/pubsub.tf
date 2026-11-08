@@ -33,7 +33,7 @@ resource "google_cloud_run_v2_service" "cocina" {
     service_account = google_service_account.cocina.email
 
     scaling {
-      max_instance_count = 3
+      max_instance_count = var.max_instancias_cocina
     }
 
     # Tantas peticiones a la vez como hilos tiene gunicorn en la cocina.
