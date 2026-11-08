@@ -70,6 +70,10 @@ resource "google_cloud_run_v2_service" "backend" {
         name  = "BASE_DATOS"
         value = google_firestore_database.cafeteria.name
       }
+
+      env {
+        name  = "TEMA"
+        value = google_pubsub_topic.pedidos.id
     }
   }
 
