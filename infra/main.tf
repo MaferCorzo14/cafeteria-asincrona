@@ -75,6 +75,7 @@ resource "google_cloud_run_v2_service" "backend" {
         name  = "TEMA"
         value = google_pubsub_topic.pedidos.id
     }
+    }
   }
 
   # El backend prepara el inventario al arrancar, así que necesita el permiso
