@@ -20,7 +20,7 @@ resource "google_service_account" "cocina" {
 
 resource "google_project_iam_member" "cocina_firestore" {
   project = var.proyecto
-  role    = "roles/pubsub.publisher"
+  role    = "roles/datastore.user"
   member  = google_service_account.cocina.member
 }
 
