@@ -84,6 +84,41 @@ resource "google_service_account_iam_member" "pubsub_firma_tokens" {
   depends_on = [google_pubsub_topic.pedidos]
 }
 
+# ---------- Mensajes muertos ----------
+
+# Tema al que va a parar un pedido que la cocina no logra procesar después de
+# varios intentos (por ejemplo, el plato misterioso).
+resource "google_pubsub_topic" "pedidos_muertos" {
+  name = "${var.prefijo}-pedidos-muertos"
+
+  depends_on = [google_project_service.apis]
+}
+
+# Un tema sin suscripciones descarta lo que recibe. Esta suscripción de tipo
+# pull guarda los mensajes muertos para poder revisarlos y reprocesarlos.
+resource "google_pubsub_subscription" "pedidos_muertos" {
+  name  = "${var.prefijo}-pedidos-muertos"
+  topic = google_pubsub_topic.pedidos_muertos.id
+
+  # Se conservan 7 días, el máximo, para dar tiempo de revisarlos.
+  message_retention_duration = "604800s"
+}
+
+# El agente de Pub/Sub es quien mueve el mensaje, así que necesita publicar en
+# el tema de mensajes muertos...
+resource "google_pubsub_topic_iam_member" "agente_publica_muertos" {
+  topic  = google_pubsub_topic.pedidos_muertos.name
+  role   = "roles/pubsub.publisher"
+  member = local.agente_pubsub
+}
+
+# ...y confirmar (ack) el mensaje original en la suscripción de la cocina.
+resource "google_pubsub_subscription_iam_member" "agente_confirma_cocina" {
+  subscription = google_pubsub_subscription.cocina.name
+  role         = "roles/pubsub.subscriber"
+  member       = local.agente_pubsub
+}
+
 resource "google_pubsub_subscription" "cocina" {
   name  = "${var.prefijo}-cocina"
   topic = google_pubsub_topic.pedidos.id
@@ -93,6 +128,13 @@ resource "google_pubsub_subscription" "cocina" {
   retry_policy {
     minimum_backoff = "10s"
     maximum_backoff = "60s"
+  }
+
+  # Después de 5 entregas fallidas el mensaje se manda al tema de mensajes
+  # muertos y deja de reintentarse.
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.pedidos_muertos.id
+    max_delivery_attempts = 5
   }
 
   push_config {

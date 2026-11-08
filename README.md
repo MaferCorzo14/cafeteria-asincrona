@@ -207,7 +207,79 @@ Frontend:
 
 ## Decisiones del reto
 
-<!-- Qué cambiaste, por qué y cómo comprobaste que funciona. -->
+El reto tenía dos problemas que Pub/Sub provoca por su forma de entregar mensajes: el plato misterioso se reintenta sin parar, y un mismo pedido puede llegar más de una vez y descontar el inventario de más. Resolvimos cada uno en el lugar donde tiene sentido hacerlo.
+
+### 1. El plato misterioso: tema de mensajes muertos
+
+**Qué cambiamos** (`infra/pubsub.tf`):
+
+- Un tema `<prefijo>-pedidos-muertos` y una suscripción pull `<prefijo>-pedidos-muertos` que guarda lo que llegue, durante 7 días.
+- Una `dead_letter_policy` en la suscripción de la cocina con `max_delivery_attempts = 5`.
+- Dos permisos para el agente de servicio de Pub/Sub: `pubsub.publisher` sobre el tema de mensajes muertos y `pubsub.subscriber` sobre la suscripción de la cocina.
+
+**Por qué:**
+
+- *Reintentar para siempre no sirve.* El plato misterioso falla siempre, porque la cocina no tiene receta. Un reintento más no lo arregla; solo llena los logs durante los 7 días que Pub/Sub retiene el mensaje. Después de 5 intentos lo correcto es apartarlo y dejar de gastar recursos.
+- *Elegimos 5 intentos porque es el mínimo que permite Pub/Sub.* Con el `retry_policy` que ya teníamos (de 10 s a 60 s entre intentos), el mensaje se descarta en unos 2 o 3 minutos. Los fallos pasajeros de verdad, como una cocina que se reinicia, se resuelven en el segundo o tercer intento, así que 5 deja margen sin alargar la espera.
+- *Una suscripción en el tema de mensajes muertos.* Un tema sin suscripciones descarta lo que recibe, y el pedido fallido se perdería sin que nadie pueda revisarlo. Con la suscripción pull queda guardado para inspeccionarlo o reprocesarlo a mano.
+- *Los dos permisos son el mínimo.* Quien mueve el mensaje al tema de mensajes muertos no es la cocina ni el backend, sino el agente de Pub/Sub. Necesita publicar en el tema nuevo y confirmar el mensaje original en la suscripción. Cada permiso está dado sobre ese recurso y no sobre todo el proyecto, igual que el resto de la práctica.
+
+**Cómo se comprueba:**
+
+```bash
+# Crear un pedido con "plato-misterioso" desde la página y luego:
+gcloud run services logs read <prefijo>-cocina --region us-central1 --limit 30
+#   → "intento de entrega 1", "2", ... "5" y después ya no aparecen más
+
+gcloud pubsub subscriptions pull <prefijo>-pedidos-muertos --limit 5 --auto-ack
+#   → devuelve el id del pedido que falló
+```
+
+<!-- TODO: pegar aquí la captura de los logs con los 5 intentos y la salida del pull. -->
+
+**Límite que conocemos:** el pedido del plato misterioso se queda en `preparando` en la pantalla, porque la cocina falla antes de cambiarlo. Una mejora sería que un proceso lea el tema de mensajes muertos y pase esos pedidos a `rechazado`. No lo hicimos porque el enunciado pide detener los reintentos, no cambiar el estado del pedido.
+
+### 2. Entregas repetidas: cocina idempotente
+
+**Qué cambiamos** (`cocina/main.py`):
+
+- Si el pedido ya está en `listo` o `rechazado` cuando llega el mensaje, la cocina responde `204` sin preparar nada.
+- Revisar el inventario, descontarlo y marcar el pedido como `listo` (o `rechazado`) ahora ocurre dentro de **una transacción de Firestore**, y dentro de ella se vuelve a leer el estado del pedido.
+
+**Por qué:**
+
+- *Pub/Sub entrega "al menos una vez", no "exactamente una".* Se puede provocar con `PROBABILIDAD_FALLO`: la cocina termina el trabajo, se cae antes de responder `2xx` y Pub/Sub entrega el mismo pedido otra vez. Con el código original, el descuento se repetía en cada entrega. La entrega exactamente una vez de Pub/Sub existe solo para suscripciones pull, no para push, así que no era una opción y la solución tiene que estar en la cocina.
+- *El estado del pedido ya es la llave de idempotencia.* Podíamos haber guardado los `messageId` ya vistos en una colección nueva, pero el pedido ya dice si terminó. Así no hay una segunda fuente de verdad que mantener ni una colección que crezca sin límite.
+- *La revisión de antes de empezar no basta, por eso la transacción.* Dos entregas pueden llegar casi a la vez (Cloud Run tiene hasta 3 instancias): las dos ven `preparando`, las dos esperan los 6 s y las dos descuentan. Dentro de la transacción Firestore reintenta a la que pierde, y esa segunda ya ve el pedido terminado y no descuenta.
+- *Revisar y descontar juntos.* Antes la cocina leía las existencias y luego escribía en pasos separados. En la transacción las lecturas y las escrituras son atómicas, lo que también evita vender dos veces la última empanada.
+- *Lo que no cambiamos.* El plato misterioso sigue respondiendo `500` y los sobres inválidos `400`. Eso es lo que hace funcionar los reintentos y la política de mensajes muertos del punto 1.
+
+**Cómo se comprueba:** con una cocina local que siempre falla después de terminar (`PROBABILIDAD_FALLO=1`), entregando el mismo pedido dos veces:
+
+```bash
+curl -s localhost:8081/menu                  # anota las existencias de lo que pediste
+curl -i -X POST localhost:8082/ -H 'Content-Type: application/json' \
+  -d "{\"message\": {\"data\": \"$(printf %s "$ID" | base64)\"}, \"deliveryAttempt\": 1}"   # 500, trabajo hecho
+curl -i -X POST localhost:8082/ -H 'Content-Type: application/json' \
+  -d "{\"message\": {\"data\": \"$(printf %s "$ID" | base64)\"}, \"deliveryAttempt\": 2}"   # 204, no hace nada
+curl -s localhost:8081/menu                  # bajaron una sola vez
+```
+
+(La cocina local se levanta como en la sección de `docker run`, agregando `-e PROBABILIDAD_FALLO=1`.) Con el código original, las existencias bajaban en cada entrega; ahora bajan una sola vez. También probamos la lógica de la cocina con un Firestore simulado: entrega normal, tres reentregas seguidas, reentrega mientras otra termina, rechazo por falta de inventario, plato misterioso (`500`) y sobre inválido (`400`).
+
+<!-- TODO: pegar aquí las existencias antes y después, y los logs de la cocina con "entrega repetida". -->
+
+### Cómo desplegar estos cambios
+
+La imagen de la cocina cambió, así que hay que subirla con una etiqueta nueva (si no, Terraform no ve el cambio):
+
+```bash
+cd <tu-repositorio>
+docker build -t $REGISTRO/cocina:v2 cocina
+docker push $REGISTRO/cocina:v2
+# En infra/terraform.tfvars: imagen_cocina = "<...>/cocina:v2"
+cd infra && terraform apply
+```
 
 ## Preguntas
 
