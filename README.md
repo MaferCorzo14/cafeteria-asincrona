@@ -191,7 +191,7 @@ El plato misterioso falla siempre, y sin un tema de mensajes muertos Pub/Sub lo 
 
 | Nombre | Código | Usuario de GitHub |
 |---|---|---|
-| | | |
+|Juan Camilo Uribe | 1152326 | camilo2212 |
 
 ## URL de la cafetería
 
