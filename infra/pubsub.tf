@@ -48,10 +48,7 @@ resource "google_cloud_run_v2_service" "cocina" {
         
       }
 
-      env {
-        name  = "PROBABILIDAD_FALLO"
-        value = "0.5"
-      }
+    
     }
   }
 
