@@ -231,7 +231,7 @@ El reto tenía dos problemas que Pub/Sub provoca por su forma de entregar mensaj
 **Por qué:**
 
 - *5 es el mínimo que admite Pub/Sub.* El plato misterioso falla siempre porque la cocina no tiene receta; un intento más nunca lo arregla y solo llena los logs durante los 7 días que Pub/Sub retiene el mensaje. Por eso pusimos el valor más bajo posible en vez de uno grande.
-- *Con el `retry_policy` que ya teníamos (de 10 s a 60 s entre intentos), 5 intentos son unos 2 o 3 minutos.* Es tiempo de sobra para un problema pasajero: una instancia que arranca en frío, una transacción que perdió la pelea por el inventario o un reinicio de la cocina se resuelven en el segundo o tercer intento.
+- *Con el `retry_policy` que ya teníamos (de 10 s a 60 s entre intentos), medimos que 5 intentos se agotan en 66 segundos (de las 00:21:34 a las 00:22:40 en los logs, con esperas de 13, 15, 16 y 22 s).* Es tiempo suficiente para un problema pasajero: una instancia que arranca en frío, una transacción que perdió la pelea por el inventario o un reinicio de la cocina se resuelven en el segundo o tercer intento.
 - *Qué pasa con un pedido que falla por un problema pasajero.* Como la cocina solo descarta pedidos en `listo` o `rechazado`, un pedido que se quedó en `preparando` por una falla pasajera **sí se vuelve a preparar** en el siguiente intento. Solo llega al tema de muertos si falla 5 veces seguidas.
 - *Con `PROBABILIDAD_FALLO` en 0.5, 5 intentos casi nunca se agotan.* Un pedido que ya quedó `listo` responde `204` apenas se reentrega, así que cada pedido recibe como mucho dos entregas y ninguno llega a mensajes muertos (ver pregunta 3).
 
@@ -300,6 +300,10 @@ Para un pedido de un tinto, la cocina idempotente cuesta 3 lecturas y 3 escritur
 ### Cómo comprobamos que funciona
 
 - **Idempotencia.** Con la falla al 0.5 el inventario tiene que cuadrar: cada pedido baja las existencias una sola vez. Probamos la lógica de la cocina con un Firestore simulado: 4000 pedidos con `PROBABILIDAD_FALLO = 0.5` descontaron exactamente 4000 tintos, ninguno llegó a mensajes muertos y cada pedido recibió en promedio 1.508 entregas. También probamos tres reentregas seguidas, una reentrega mientras otra termina, un rechazo por falta de inventario, el plato misterioso (`500`) y un sobre inválido (`400`). Falta repetirlo en la nube.
+- **Inventario bajo concurrencia.** Se reinició el inventario (tinto = 20) y se lanzaron 15 pedidos de 1 tinto, 5 en paralelo. Quedaron 5 existencias: cada pedido descontó una sola unidad.
+
+![Inventario después de 15 pedidos concurrentes](evidencias/reto/reto-inventario-concurrencia.jpeg)
+
 - **Mensajes muertos.** Se crea un pedido con `plato-misterioso`; en los logs de la cocina el intento deja de decir "desconocido" y pasa de 1 a 5, y después no aparecen más. El mensaje se lee de la suscripción de muertos:
 
 ```bash
@@ -307,11 +311,25 @@ gcloud run services logs read <prefijo>-cocina --region us-central1 --limit 30
 gcloud pubsub subscriptions pull <prefijo>-pedidos-muertos --limit 5 --auto-ack
 ```
 
-<!-- TODO: pegar la captura de los logs con los 5 intentos y la salida del pull. -->
+En los logs del pedido con el plato misterioso, el intento de entrega sube de 1 a 5 y después no aparece ninguno más:
+
+![Intentos 1 a 5 del plato misterioso](evidencias/reto/reto-intentos-1-a-5.jpeg)
+
+Cada intento termina en `500`, con el error de que la cocina no tiene receta:
+
+![Logs de la cocina con el error del plato misterioso](evidencias/reto/reto-logs-plato-misterioso.jpeg)
+
+El mensaje quedó en la suscripción de muertos. El atributo `CloudPubSubDeadLetterSourceDeliveryCount=5` confirma que Pub/Sub lo movió tras 5 entregas:
+
+![Pull de la suscripción de mensajes muertos](evidencias/reto/reto-mensaje-muerto-pull.jpeg)
 
 - **Reproducir.** `terraform destroy`, esperar unos 5 minutos (Firestore no deja reutilizar enseguida el nombre de una base borrada) y volver a aplicar con los mismos pasos del primer despliegue. No hay pasos a mano en la consola.
 
-<!-- TODO: dejar constancia de la reproducción completa desde cero. -->
+El `terraform apply` creó los 21 recursos sin pasos manuales en la consola:
+
+![terraform apply: 21 recursos creados](evidencias/reto/reto-terraform-apply.jpeg)
+
+<!-- TODO: falta mostrar el terraform destroy previo para dejar constancia completa de la reproducción. -->
 
 ### Cómo desplegar estos cambios
 
@@ -337,15 +355,21 @@ Con la cocina de la plantilla, en promedio **2 veces**, y con nuestra cocina ide
 Comparado con lo que medimos: en una simulación de la lógica de la cocina con un Firestore simulado (4000 pedidos, falla al 0.5, máximo 5 entregas) cada pedido recibió en promedio 1.508 entregas, muy cerca del 1.5 esperado, y el inventario descontó exactamente 4000 unidades. En la nube se mide contando las líneas "intento de entrega" por pedido en los registros de la cocina (con un mínimo de unos 50 pedidos, porque con 4 el promedio varía demasiado):
 
 ```bash
-gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="<prefijo>-cocina" AND textPayload:"intento de entrega"' \
-  --limit 1000 --format='value(textPayload)' \
-  | awk '{c[$2]++} END {for (i in c) {n++; t += c[i]} print t / n, "entregas por pedido,", n, "pedidos"}'
+gcloud run services logs read <prefijo>-cocina --region us-central1 --limit 2000 \
+  | grep "intento de entrega" | grep -v -e <id-prueba-previa> -e <id-plato-misterioso> \
+  | awk '{c[$4]++} END {for (i in c) {n++; t+=c[i]} print t/n, "entregas por pedido,", n, "pedidos"}'
 ```
+
+El `grep -v` excluye los dos pedidos que no eran de la prueba: uno de una prueba previa y el del plato misterioso.
 
 | Cocina | Esperado | Medido en la nube |
 |---|---|---|
-| Plantilla | 2 (1.94 con tope de 5 intentos) | |
-| Idempotente | 1.5 | |
+| Plantilla | 2 (1.94 con tope de 5 intentos) | *(pendiente: falta desplegar la cocina de la plantilla)* |
+| Idempotente | 1.5 | **1.43** (58 pedidos) |
 
-<!-- TODO: llenar la columna "Medido en la nube" con la salida del comando para cada cocina y comentar la diferencia. -->
+![Promedio de entregas por pedido](evidencias/reto/reto-promedio-entregas.jpeg)
+
+El 1.43 medido con 58 pedidos es consistente con el 1.5 esperado: cada pedido recibe 1 o 2 entregas, así que con 58 pedidos el error típico del promedio es de unos 0.07 y 1.43 queda a un error típico de distancia.
+
+<!-- TODO: medir la cocina de la plantilla y comentar la diferencia con la idempotente. -->
 
