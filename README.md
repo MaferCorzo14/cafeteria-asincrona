@@ -191,19 +191,152 @@ El plato misterioso falla siempre, y sin un tema de mensajes muertos Pub/Sub lo 
 
 | Nombre | Código | Usuario de GitHub |
 |---|---|---|
-|Juan Camilo Uribe | 1152326 | camilo2212 |
+| Juan Camilo Uribe | 1152326 | camilo2212 |
+| Alison Brigitte Martinez Machado | 1152299 | AlisonBrM |
+| Maria Fernanda Corzo Castro | 1152300 | MaferCorzo14 |
 
 ## URL de la cafetería
 
-Frontend:
+Frontend: https://grupo6-frontend-6vwftsycuq-uc.a.run.app/
 
 ## Diagrama propio
 
-<!-- Tu diagrama en Mermaid de lo que desplegaste, con los nombres reales de tus recursos. -->
+Todo vive en el proyecto `cloud-computing-470223`, región `us-central1`, con el prefijo `grupo6`.
+
+```mermaid
+flowchart LR
+    telefono(["Teléfono"])
+    todos(["allUsers"])
+
+    subgraph run["Cloud Run"]
+        frontend["grupo6-frontend<br/>público"]
+        backend["grupo6-backend<br/>público"]
+        cocina["grupo6-cocina<br/>privado"]
+    end
+
+    subgraph datos["Datos e imágenes"]
+        firestore[("Firestore<br/>grupo6-cafeteria")]
+        registro["Artifact Registry<br/>grupo6-imagenes"]
+    end
+
+    subgraph pubsub["Pub/Sub"]
+        tema{{"Tema<br/>grupo6-pedidos"}}
+        suscripcion["Suscripción push<br/>grupo6-cocina<br/>máx. 5 intentos"]
+        muertos{{"Tema<br/>grupo6-pedidos-muertos"}}
+        subMuertos["Suscripción pull<br/>grupo6-pedidos-muertos"]
+    end
+
+    subgraph cuentas["Cuentas de servicio"]
+        saBackend["grupo6-backend@"]
+        saCocina["grupo6-cocina@"]
+        invocador["grupo6-invocador@"]
+        agente["Agente de Pub/Sub<br/>service-1036298518517@<br/>gcp-sa-pubsub"]
+    end
+
+    telefono -->|"carga la página"| frontend
+    telefono -->|"GET /menu, POST /pedidos"| backend
+    backend -->|"guarda el pedido"| firestore
+    backend -->|"publica el id"| tema
+    tema --> suscripcion
+    suscripcion -->|"POST / con token OIDC"| cocina
+    suscripcion -->|"tras 5 fallos"| muertos
+    muertos --> subMuertos
+    cocina -->|"cambia el estado y descuenta"| firestore
+    registro -. "imágenes v2" .-> run
+
+    todos -.->|"run.invoker"| frontend
+    todos -.->|"run.invoker"| backend
+    saBackend -.->|"datastore.user (proyecto)"| firestore
+    saBackend -.->|"pubsub.publisher · fase 2"| tema
+    saCocina -.->|"datastore.user (proyecto) · fase 3"| firestore
+    invocador -.->|"run.invoker · fase 3"| cocina
+    agente -.->|"iam.serviceAccountTokenCreator · fase 3"| invocador
+    agente -.->|"pubsub.publisher · reto"| muertos
+    agente -.->|"pubsub.subscriber · reto"| suscripcion
+```
+
+Las flechas punteadas son permisos de IAM: la etiqueta es el rol sin `roles/` y la flecha llega al recurso sobre el que se da. Cada servicio corre con su propia cuenta (`grupo6-backend@`, `grupo6-cocina@`, `grupo6-frontend@`). La cocina no tiene `allUsers`: solo la puede llamar `grupo6-invocador`, que es la cuenta con la que Pub/Sub firma el token de cada entrega.
 
 ## Evidencias por fase
 
-<!-- Una subsección por cada fase de la guía, con capturas o salidas de comandos y unas líneas de lo que observaste. -->
+### Fase 0: preparación
+
+El repositorio del grupo con los colaboradores agregados y `gcloud config list` con el proyecto `cloud-computing-470223` de quien despliega.
+
+![Colaboradores del repositorio](evidencias/preparacion/colaboradores.png)
+![gcloud config list](evidencias/preparacion/config-list.png)
+
+### Fase 1: base desplegada
+
+Las tres imágenes (`backend`, `frontend` y `cocina`) quedaron en el registro `grupo6-imagenes`. El pedido se queda en `recibido` porque la variable `TEMA` del backend está vacía: guarda el pedido en Firestore, pero no le avisa a nadie, y por cada pedido deja una advertencia en sus registros.
+
+![Imágenes en Artifact Registry](evidencias/registro,%20imagenes%20y%20base/artifact-registry.png)
+![Pedido en recibido](evidencias/registro,%20imagenes%20y%20base/pedido.jpeg)
+![Advertencia en el registro del backend](evidencias/registro,%20imagenes%20y%20base/registro-backend.png)
+
+Algo que aprendimos: al subir una imagen con la misma etiqueta que ya estaba en el registro, Terraform no ve el cambio y Cloud Run sigue con la versión anterior. Por eso usamos `v2`.
+
+### Fase 2: el tema
+
+Con `TEMA` apuntando a `grupo6-pedidos`, el registro del backend ya no muestra la advertencia, sino `Pedido ... publicado en projects/cloud-computing-470223/topics/grupo6-pedidos`. El pedido sigue en `recibido`, ahora por otra razón: el tema no tiene suscripciones y descarta el mensaje.
+
+![Pedido publicado en el registro del backend](evidencias/tema/pedido-publicado.png)
+![Tema grupo6-pedidos en la consola](evidencias/tema/tema.png)
+![Pedido todavía en recibido](evidencias/tema/recibido.jpeg)
+
+### Fase 3: cocina privada y suscripción push
+
+Con la suscripción push `grupo6-cocina`, el pedido avanza solo hasta `listo` y en los registros de la cocina se ve cómo lo procesa. Al llamar a la cocina con `curl` sin token, Cloud Run responde `403` antes de que la petición llegue al código.
+
+![Pedido en listo](evidencias/cocina%20privada/pedido-listo.jpeg)
+![Registro de la cocina procesando el pedido](evidencias/cocina%20privada/cocina-procesando.png)
+![Suscripción grupo6-cocina en Pub/Sub](evidencias/cocina%20privada/suscripcion.png)
+![curl a la cocina con 403](evidencias/cocina%20privada/curl.png)
+
+Al principio la cocina respondía `500` con `403 Missing or insufficient permissions` de Firestore, porque a su cuenta se le había dado `pubsub.publisher` en vez de `datastore.user`. Al corregir el rol, los pedidos que esperaban pasaron solos a `listo`, porque Pub/Sub los siguió reintentando.
+
+### Fase 4: lo asíncrono, visto
+
+Lanzamos una ráfaga de 60 pedidos de un tinto. El backend respondió `201` a cada pedido que le llegó sin esperar a la cocina, y los pedidos se fueron repartiendo entre las columnas a medida que la cocina los preparaba, no en el orden en que se hicieron. Solo había 20 tintos: el inventario terminó en 0 y el resto de los pedidos quedó `rechazado`. Cloud Run subió la cocina hasta 3 instancias, el máximo que declaramos.
+
+![Salida de la ráfaga](evidencias/asincrono/Evidencia%2004.3.png)
+![Pantalla y el inventario después de la ráfaga](evidencias/asincrono/Evidencia%2004.png)
+![Métricas de la suscripción grupo6-cocina](evidencias/asincrono/Evidencia%2004.1.png)
+![Instancias de la cocina](evidencias/asincrono/Evidencia%2004.2.jpeg)
+
+### Fase 5: una falla a propósito
+
+Con `PROBABILIDAD_FALLO = 0.5`, repusimos el inventario (20 tintos) e hicimos 4 pedidos de un tinto. Quedaron 13 tintos: **se descontaron 7 por 4 pedidos**. En los registros de la cocina se ve el mismo pedido procesado más de una vez: queda `listo`, la falla simulada hace que no se confirme, Pub/Sub lo entrega otra vez y la cocina vuelve a descontar. Al terminar quitamos la variable y aplicamos.
+
+![Inventario descontado de más](evidencias/fallo/Evidencia%2005.png)
+![Pedido procesado dos veces (1)](evidencias/fallo/Evidencia%2005.1.jpeg)
+![Pedido procesado dos veces (2)](evidencias/fallo/Evidencia%2005.2.jpeg)
+
+### Fase 6: reto
+
+La explicación de cada decisión, el comando de medición y la cuenta de lecturas y escrituras están en [Decisiones del reto](#decisiones-del-reto).
+
+El reto se probó en un despliegue completo desde cero con el prefijo `juan1` (mismo proyecto `cloud-computing-470223`), por eso los recursos de estas capturas se llaman `juan1-cocina`, `juan1-pedidos-muertos`, etc.
+
+**Inventario que cuadra.** Con la cocina idempotente, repusimos el inventario (20 tintos) y lanzamos 15 pedidos de un tinto, 5 en paralelo. Quedaron 5 tintos: cada pedido descontó una sola unidad.
+
+![Inventario después de 15 pedidos concurrentes](evidencias/reto/reto-inventario-concurrencia.jpeg)
+
+**Entregas por pedido con la falla al 0.5.** En 58 pedidos, cada uno le llegó en promedio **1.43 veces** a la cocina, cerca del 1.5 esperado (ver pregunta 3).
+
+![Promedio de entregas por pedido](evidencias/reto/reto-promedio-entregas.jpeg)
+
+**Mensajes muertos.** El pedido del plato misterioso falla en cada intento, y el número de intento sube de 1 a 5. Después no hay más reintentos: Pub/Sub movió el mensaje a `juan1-pedidos-muertos`, de donde lo leímos con `gcloud pubsub subscriptions pull`. El atributo `CloudPubSubDeadLetterSourceDeliveryCount=5` confirma que llegó ahí tras 5 entregas.
+
+![Intentos 1 a 5 del plato misterioso](evidencias/reto/reto-intentos-1-a-5.jpeg)
+![Error de la cocina en cada intento](evidencias/reto/reto-logs-plato-misterioso.jpeg)
+![Mensaje leído de la suscripción de mensajes muertos](evidencias/reto/reto-mensaje-muerto-pull.jpeg)
+
+**Reproducción desde cero.** Con el prefijo `juan1`, un solo `terraform apply` creó los 21 recursos (servicios, cuentas, permisos, temas y suscripciones) sin pasos manuales en la consola.
+
+![terraform apply con 21 recursos creados](evidencias/reto/reto-terraform-apply.jpeg)
+
+**Pendiente:** la tabla de tiempos con 1, 2 y 3 instancias de la cocina, la captura del `terraform destroy` previo a la reproducción y la medición con la cocina de la plantilla.
 
 ## Decisiones del reto
 
@@ -302,7 +435,7 @@ Para un pedido de un tinto, la cocina idempotente cuesta 3 lecturas y 3 escritur
 - **Idempotencia.** Con la falla al 0.5 el inventario tiene que cuadrar: cada pedido baja las existencias una sola vez. Probamos la lógica de la cocina con un Firestore simulado: 4000 pedidos con `PROBABILIDAD_FALLO = 0.5` descontaron exactamente 4000 tintos, ninguno llegó a mensajes muertos y cada pedido recibió en promedio 1.508 entregas. También probamos tres reentregas seguidas, una reentrega mientras otra termina, un rechazo por falta de inventario, el plato misterioso (`500`) y un sobre inválido (`400`). Falta repetirlo en la nube.
 - **Inventario bajo concurrencia.** Se reinició el inventario (tinto = 20) y se lanzaron 15 pedidos de 1 tinto, 5 en paralelo. Quedaron 5 existencias: cada pedido descontó una sola unidad.
 
-![Inventario después de 15 pedidos concurrentes](evidencias/reto/reto-inventario-concurrencia.jpeg)
+Captura en [Evidencias, fase 6](#fase-6-reto).
 
 - **Mensajes muertos.** Se crea un pedido con `plato-misterioso`; en los logs de la cocina el intento deja de decir "desconocido" y pasa de 1 a 5, y después no aparecen más. El mensaje se lee de la suscripción de muertos:
 
@@ -311,42 +444,34 @@ gcloud run services logs read <prefijo>-cocina --region us-central1 --limit 30
 gcloud pubsub subscriptions pull <prefijo>-pedidos-muertos --limit 5 --auto-ack
 ```
 
-En los logs del pedido con el plato misterioso, el intento de entrega sube de 1 a 5 y después no aparece ninguno más:
-
-![Intentos 1 a 5 del plato misterioso](evidencias/reto/reto-intentos-1-a-5.jpeg)
-
-Cada intento termina en `500`, con el error de que la cocina no tiene receta:
-
-![Logs de la cocina con el error del plato misterioso](evidencias/reto/reto-logs-plato-misterioso.jpeg)
-
-El mensaje quedó en la suscripción de muertos. El atributo `CloudPubSubDeadLetterSourceDeliveryCount=5` confirma que Pub/Sub lo movió tras 5 entregas:
-
-![Pull de la suscripción de mensajes muertos](evidencias/reto/reto-mensaje-muerto-pull.jpeg)
+En los logs del pedido con el plato misterioso, el intento de entrega sube de 1 a 5 y después no aparece ninguno más. Cada intento termina en `500`, con el error de que la cocina no tiene receta. El mensaje quedó en la suscripción de muertos, y el atributo `CloudPubSubDeadLetterSourceDeliveryCount=5` confirma que Pub/Sub lo movió tras 5 entregas. Capturas en [Evidencias, fase 6](#fase-6-reto).
 
 - **Reproducir.** `terraform destroy`, esperar unos 5 minutos (Firestore no deja reutilizar enseguida el nombre de una base borrada) y volver a aplicar con los mismos pasos del primer despliegue. No hay pasos a mano en la consola.
 
-El `terraform apply` creó los 21 recursos sin pasos manuales en la consola:
-
-![terraform apply: 21 recursos creados](evidencias/reto/reto-terraform-apply.jpeg)
+El `terraform apply` creó los 21 recursos sin pasos manuales en la consola (captura en [Evidencias, fase 6](#fase-6-reto)).
 
 <!-- TODO: falta mostrar el terraform destroy previo para dejar constancia completa de la reproducción. -->
 
 ### Cómo desplegar estos cambios
 
-La imagen de la cocina cambió, así que hay que subirla con una etiqueta nueva (si no, Terraform no ve el cambio):
+La imagen de la cocina cambió, así que hay que subirla con una etiqueta nueva (si no, Terraform no ve el cambio). La `v2` ya está en el registro con la cocina de la fase 3, por eso se usa `v3`:
 
 ```bash
-docker build -t $REGISTRO/cocina:v2 cocina
-docker push $REGISTRO/cocina:v2
-# En infra/terraform.tfvars: imagen_cocina = "<...>/cocina:v2"
+docker build -t $REGISTRO/cocina:v3 cocina
+docker push $REGISTRO/cocina:v3
+# En infra/terraform.tfvars: imagen_cocina = "<...>/cocina:v3"
 cd infra && terraform apply
 ```
 
 ## Preguntas
 
-<!-- Pregunta 1: ¿Por qué el pedido de la fase 2 nunca se preparó, aunque después crearon la suscripción? -->
+### 1. ¿Por qué el pedido de la fase 2 nunca se preparó, aunque después crearon la suscripción?
 
-<!-- Pregunta 2: Si quitan el run.invoker de la cuenta invocadora, ¿qué deja de funcionar, cuánto tarda en notarse, qué ve el cliente y dónde encontrarían el error? -->
+Porque un tema de Pub/Sub no guarda mensajes: solo le pasa una copia a las suscripciones que existen en ese momento. Cuando hicimos el pedido de la fase 2, el tema `grupo6-pedidos` todavía no tenía ninguna suscripción, así que el mensaje se descartó. La suscripción que creamos en la fase 3 solo recibe lo que se publica después de existir, no lo de antes. El pedido quedó guardado en Firestore como `recibido`, pero nadie le volvió a avisar a la cocina.
+
+### 2. Si quitan el `run.invoker` de la cuenta invocadora, ¿qué deja de funcionar, cuánto tarda en notarse, qué ve el cliente y dónde encontrarían el error?
+
+Deja de funcionar la entrega de Pub/Sub a la cocina: Cloud Run rechaza cada intento con `403` antes de que llegue al código. Se nota con el siguiente pedido, uno o dos minutos después del cambio (lo que tarda en propagarse el permiso). El cliente no ve ningún error: el backend responde normal, le da su número y el pedido se queda en `recibido` para siempre. Después de 5 intentos el mensaje termina en `grupo6-pedidos-muertos`. El error no aparece en los registros de texto de la cocina, porque la petición nunca llegó a su código. Se encuentra en su registro de solicitudes (`run.googleapis.com/requests`), con los `POST` en `403`.
 
 ### 3. Con `PROBABILIDAD_FALLO` en 0.5, ¿cuántas veces le llega en promedio un mismo pedido a la cocina?
 
@@ -367,7 +492,7 @@ El `grep -v` excluye los dos pedidos que no eran de la prueba: uno de una prueba
 | Plantilla | 2 (1.94 con tope de 5 intentos) | *(pendiente: falta desplegar la cocina de la plantilla)* |
 | Idempotente | 1.5 | **1.43** (58 pedidos) |
 
-![Promedio de entregas por pedido](evidencias/reto/reto-promedio-entregas.jpeg)
+Captura en [Evidencias, fase 6](#fase-6-reto).
 
 El 1.43 medido con 58 pedidos es consistente con el 1.5 esperado: cada pedido recibe 1 o 2 entregas, así que con 58 pedidos el error típico del promedio es de unos 0.07 y 1.43 queda a un error típico de distancia.
 
