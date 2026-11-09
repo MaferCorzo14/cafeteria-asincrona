@@ -18,6 +18,7 @@ BASE_DATOS = os.environ.get("BASE_DATOS", "(default)")
 TIEMPO_PREPARACION = float(os.environ.get("TIEMPO_PREPARACION", "6"))
 PROBABILIDAD_FALLO = float(os.environ.get("PROBABILIDAD_FALLO", "0"))
 PLATO_MISTERIOSO = "plato-misterioso"
+ESTADOS_FINALES = ("listo", "rechazado")
 
 app = Flask(__name__)
 
@@ -29,6 +30,42 @@ def db():
 
 def ahora():
     return datetime.now(timezone.utc)
+
+
+@firestore.transactional
+def terminar_pedido(transaction, pedido_ref, cantidades):
+    """Revisa el inventario, lo descuenta y cierra el pedido en un solo paso.
+
+    Todo ocurre en una transacción: si dos entregas del mismo mensaje llegan a
+    la vez, Firestore reintenta a la que perdió y esta vez ya ve el pedido
+    terminado, así que el descuento se hace una sola vez.
+
+    Devuelve ("listo" | "rechazado" | "repetido", productos que faltan).
+    """
+    # Firestore exige hacer todas las lecturas antes de la primera escritura.
+    estado = pedido_ref.get(transaction=transaction).get("estado")
+    if estado in ESTADOS_FINALES:
+        return "repetido", []
+
+    inventario = db().collection("inventario")
+    existencias = {
+        producto: inventario.document(producto).get(transaction=transaction).get("existencias") or 0
+        for producto in cantidades
+    }
+    faltan = [producto for producto, cantidad in cantidades.items() if existencias[producto] < cantidad]
+
+    if faltan:
+        transaction.update(pedido_ref, {
+            "estado": "rechazado",
+            "motivo": "Se acabó: " + ", ".join(faltan),
+            "actualizado": ahora(),
+        })
+        return "rechazado", faltan
+
+    for producto, cantidad in cantidades.items():
+        transaction.update(inventario.document(producto), {"existencias": firestore.Increment(-cantidad)})
+    transaction.update(pedido_ref, {"estado": "listo", "actualizado": ahora()})
+    return "listo", []
 
 
 @app.post("/")
@@ -53,6 +90,13 @@ def recibir():
         log.warning("El pedido %s no existe; se descarta el mensaje", pedido_id)
         return "", 204
 
+    # Pub/Sub entrega cada mensaje al menos una vez, así que este pedido pudo
+    # terminar en una entrega anterior. Se confirma sin tocar nada.
+    if pedido.get("estado") in ESTADOS_FINALES:
+        log.info("El pedido %s ya estaba %s; entrega repetida, se confirma sin hacer nada",
+                 pedido_id, pedido.get("estado"))
+        return "", 204
+
     pedido_ref.update({"estado": "preparando", "actualizado": ahora()})
 
     cantidades = Counter()
@@ -64,25 +108,15 @@ def recibir():
 
     time.sleep(TIEMPO_PREPARACION)
 
-    inventario = db().collection("inventario")
-    faltan = [
-        producto for producto, cantidad in cantidades.items()
-        if (inventario.document(producto).get().get("existencias") or 0) < cantidad
-    ]
-    if faltan:
-        pedido_ref.update({
-            "estado": "rechazado",
-            "motivo": "Se acabó: " + ", ".join(faltan),
-            "actualizado": ahora(),
-        })
+    # Con una ráfaga, muchos pedidos pelean por el mismo documento de inventario
+    # y Firestore aborta a los que pierden. Se les da más intentos que los 5 por
+    # defecto; si aun así falla, la cocina responde 500 y Pub/Sub reentrega.
+    resultado, faltan = terminar_pedido(db().transaction(max_attempts=10), pedido_ref, cantidades)
+    if resultado == "repetido":
+        log.info("El pedido %s lo terminó otra entrega mientras se preparaba; no se descuenta de nuevo", pedido_id)
+    elif resultado == "rechazado":
         log.info("Pedido %s rechazado, no alcanza: %s", pedido_id, faltan)
     else:
-        # Ojo: si Pub/Sub entrega este mismo pedido otra vez, este descuento se repite.
-        lote = db().batch()
-        for producto, cantidad in cantidades.items():
-            lote.update(inventario.document(producto), {"existencias": firestore.Increment(-cantidad)})
-        lote.update(pedido_ref, {"estado": "listo", "actualizado": ahora()})
-        lote.commit()
         log.info("Pedido %s listo", pedido_id)
 
     # Simula que la cocina se cae justo después de terminar y antes de confirmar.
